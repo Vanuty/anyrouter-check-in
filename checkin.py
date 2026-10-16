@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+import random
 from datetime import datetime
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -38,6 +39,8 @@ from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
 
+from utils.headers import get_browser_headers
+from utils.oauth_agentrouter import AgentRouterOAuthClient
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
@@ -383,6 +386,13 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
 			return False, None, None
+	elif account.provider == 'agentrouter' and account.has_oauth_session():
+		print(f'[INFO] {account_name}: Attempting OAuth silent re-login for AgentRouter...')
+		user_cookies = parse_cookies(account.cookies)
+		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
+		if not all_cookies:
+			return False, None, None
+		return await run_agentrouter_oauth_checkin(all_cookies, account, account_name, provider_config)
 	else:
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
@@ -405,6 +415,90 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		use_proxy=provider_config.use_proxy,
 	)
 
+
+async def run_agentrouter_oauth_checkin(
+	all_cookies: dict,
+	account: AccountConfig,
+	account_name: str,
+	provider_config,
+) -> tuple[bool, dict | None, dict | None]:
+	"""通过 AgentRouter 的 OAuth 静默授权重登录流程完成真实签到。"""
+	try:
+		proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
+		oauth_client = AgentRouterOAuthClient(domain=provider_config.domain)
+
+		client_kwargs: dict = {'http2': True, 'timeout': 30.0}
+		if proxy_url:
+			client_kwargs['proxy'] = proxy_url
+			if is_debug_enabled():
+				print(f'[INFO] {account_name}: HTTP client proxy enabled: {proxy_url}')
+			else:
+				print(f'[INFO] {account_name}: HTTP client proxy enabled')
+		elif provider_config.use_proxy:
+			print(f'[WARN] {account_name}: Provider requires proxy but CHECKIN_PROXY_URL is not set')
+
+		with httpx.Client(**client_kwargs) as client:
+			if all_cookies:
+				client.cookies.update(all_cookies)
+			headers = get_browser_headers(domain=provider_config.domain)
+			if account.api_user:
+				headers[provider_config.api_user_key] = account.api_user
+
+			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+			user_info_before = get_user_info(client, headers, user_info_url)
+			if user_info_before and user_info_before.get('success'):
+				print(user_info_before['display'])
+
+			# 1. 获取签名 state
+			state = oauth_client.fetch_oauth_state(client)
+
+			# 2. 授权换 code
+			if account.github_session:
+				oauth_provider = 'github'
+				code = oauth_client.authorize_github(
+					account.github_session,
+					state,
+					proxy_url=proxy_url,
+				)
+			elif account.linuxdo_session:
+				oauth_provider = 'linuxdo'
+				code = oauth_client.authorize_linuxdo(
+					account.linuxdo_session,
+					state,
+					proxy_url=proxy_url,
+				)
+			else:
+				print(f'[FAILED] {account_name}: Missing OAuth session token')
+				return False, user_info_before, user_info_before
+
+			# 3. 回调登录发奖
+			success, user_data, checked_in, msg = oauth_client.callback_login(
+				client,
+				provider=oauth_provider,
+				code=code,
+				state=state,
+			)
+
+			if not success:
+				print(f'[FAILED] {account_name}: OAuth login callback failed - {msg}')
+				return False, user_info_before, user_info_before
+
+			uid = str(user_data.get('id') or '')
+			if uid:
+				headers[provider_config.api_user_key] = uid
+
+			user_info_after = get_user_info(client, headers, user_info_url)
+
+			if checked_in:
+				print(f'[SUCCESS] {account_name}: OAuth check-in successful! Reward added to balance.')
+			else:
+				print(f'[INFO] {account_name}: OAuth login succeeded, already checked in today.')
+
+			return True, user_info_before, user_info_after
+
+	except Exception as e:
+		print(f'[FAILED] {account_name}: OAuth check-in error: {e}')
+		return False, None, None
 
 def run_check_in_requests(
 	all_cookies: dict,
@@ -431,23 +525,10 @@ def run_check_in_requests(
 		with httpx.Client(**client_kwargs) as client:
 			client.cookies.update(all_cookies)
 
-			headers = {
-				'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				'Accept': 'application/json, text/plain, */*',
-				'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-				'Accept-Encoding': 'gzip, deflate, br, zstd',
-				'Referer': provider_config.domain,
-				'Origin': provider_config.domain,
-				'Connection': 'keep-alive',
-				'Sec-Fetch-Dest': 'empty',
-				'Sec-Fetch-Mode': 'cors',
-				'Sec-Fetch-Site': 'same-origin',
-			}
-
+			headers = get_browser_headers(domain=provider_config.domain)
 			api_user = api_user_override or account.api_user
 			if api_user:
 				headers[provider_config.api_user_key] = api_user
-
 			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
 			user_info_before = get_user_info(client, headers, user_info_url)
 			if user_info_before and user_info_before.get('success'):
@@ -459,6 +540,12 @@ def run_check_in_requests(
 				success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
 				return success, user_info_before, user_info_after
+
+			if provider_config.name == 'agentrouter':
+				print(f'[WARN] {account_name}: AgentRouter 签到奖励在登录鉴权时由服务端发放（官方 FAQ：需要退出后重新登录才会到账）。')
+				print(f'[WARN] {account_name}: 当前仅提供了静态 Session Cookie，未触发登录事件，额度不会增长。')
+				print(f'[HINT] {account_name}: 请在账号配置中添加 "github_session" 或 "linuxdo_session" 以自动签到。')
+				return False, user_info_before, user_info_before
 
 			user_info_after = get_user_info(client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
@@ -515,6 +602,10 @@ async def main():
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
+		if i > 0:
+			jitter_secs = random.randint(5, 18)
+			print(f'[INFO] Account jitter: waiting {jitter_secs}s before next account...')
+			await asyncio.sleep(jitter_secs)
 		try:
 			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
 			if success:

@@ -1,7 +1,8 @@
 name: AnyRouter 自动签到
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # 每天北京时间 08:23 与 23:23 各执行一次（对应 UTC 00:23 与 15:23）
+    - cron: '23 0,15 * * *'
   workflow_dispatch:
     inputs:
       debug:
@@ -82,11 +83,21 @@ jobs:
 
     - name: 配置代理
       env:
+        CHECKIN_PROXY_URL: ${{ secrets.CHECKIN_PROXY_URL }}
         PROXY_SUBSCRIPTION_URL: ${{ secrets.PROXY_SUBSCRIPTION_URL }}
         PROXY_TEST_URL: https://www.google.com/generate_204
+        DIRECT_PROXY_TEST_URL: https://agentrouter.org
         MIHOMO_VERSION: v1.19.27
         PROXY_REQUIRED: false
       run: bash scripts/setup_mihomo_proxy.sh
+
+    - name: 随机 Jitter 延迟（拟真人类作息）
+      if: github.event_name == 'schedule'
+      run: |
+        # 随机延迟 1 ~ 8 分钟 (60 ~ 480 秒)，消除定时机器规律
+        JITTER=$(( 60 + RANDOM % 420 ))
+        echo "⏰ 定时触发：拟真随机人类行为，延迟 ${JITTER} 秒 ($(( JITTER / 60 )) 分 $(( JITTER % 60 )) 秒)..."
+        sleep $JITTER
 
     - name: 执行签到
       env:

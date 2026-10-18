@@ -149,8 +149,8 @@ async def login_with_credentials(
 	email: str,
 	password: str,
 ) -> BrowserLoginResult | None:
-	"""使用邮箱密码通过浏览器登录，返回 cookies 与拦截到的 api user id。"""
-	print(f'[PROCESSING] {account_name}: Logging in with email/password...')
+	"""使用邮箱/用户名密码通过浏览器登录，返回 cookies 与拦截到的 api user id。"""
+	print(f'[PROCESSING] {account_name}: Logging in with credentials...')
 
 	login_url = f'{provider_config.domain}{provider_config.login_path}'
 	settings = load_browser_login_settings(
@@ -215,6 +215,27 @@ async def login_with_credentials(
 			await save_login_screenshot(page, provider_name, account_name, 'not-authenticated')
 			await context.close()
 			return None
+
+		# 在真实浏览器环境内主动触发一次签到，避免外部 httpx 被 ESA WAF 拦截 403
+		if provider_config.needs_manual_check_in():
+			try:
+				sign_res = await page.evaluate('''async () => {
+					try {
+						const r = await fetch('/api/user/sign_in', {
+							method: 'POST',
+							headers: {'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'}
+						});
+						return await r.json();
+					} catch (e) {
+						return { success: false, error: String(e) };
+					}
+				}''')
+				if sign_res and (sign_res.get('ret') == 1 or sign_res.get('code') == 0 or sign_res.get('success')):
+					print(f'[SUCCESS] {account_name}: Browser-native check-in completed: {sign_res.get("message", "success")}')
+				elif sign_res and any(k in str(sign_res.get('message', '')).lower() for k in ['已经签到', '已签到', '重复签到', 'already']):
+					print(f'[INFO] {account_name}: Browser check-in: already checked in today')
+			except Exception as e:
+				debug_print(f'[DEBUG] Browser-native check-in evaluation notice: {e}')
 
 		cookies = await context.cookies()
 		all_cookies = {
@@ -365,26 +386,27 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
-	# 邮箱密码优先
+	# 凭据登录优先（支持 email 或 username）
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
 	if account.has_login_credentials():
-		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
-		assert account.email is not None and account.password is not None
+		login_id = account.username or account.email
+		print(f'[INFO] {account_name}: Attempting credential login ({login_id}) (priority)...')
+		assert login_id is not None and account.password is not None
 		login_result = await login_with_credentials(
 			account_name,
 			provider_config,
 			account.provider,
-			account.email,
+			login_id,
 			account.password,
 		)
 		if login_result:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
-			auth_method = 'email/password'
+			auth_method = 'credentials'
 		else:
-			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
+			print(f'[FAILED] {account_name}: Credential login failed, will not use stale session cookies')
 			return False, None, None
 	elif account.provider == 'agentrouter' and account.has_oauth_session():
 		print(f'[INFO] {account_name}: Attempting OAuth silent re-login for AgentRouter...')
@@ -539,6 +561,12 @@ def run_check_in_requests(
 			if provider_config.needs_manual_check_in():
 				success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
+				if not success and user_info_before and user_info_after and user_info_before.get('success') and user_info_after.get('success'):
+					before_q = user_info_before.get('quota', 0)
+					after_q = user_info_after.get('quota', 0)
+					if after_q > before_q:
+						print(f'[SUCCESS] {account_name}: Check-in reward confirmed by balance increase (+${after_q - before_q:.2f})')
+						success = True
 				return success, user_info_before, user_info_after
 
 			if provider_config.name == 'agentrouter':

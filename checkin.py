@@ -248,7 +248,7 @@ async def login_with_credentials(
 			success_msg += f', api_user={api_user}'
 		print(success_msg)
 		await context.close()
-		return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
+		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, user_profile=user_profile)
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error during login: {e}')
@@ -405,6 +405,19 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
 			auth_method = 'credentials'
+			if account.provider == 'agentrouter':
+				profile = login_result.user_profile or {}
+				quota = round(profile.get('quota', 0) / 500000, 2)
+				used_quota = round(profile.get('used_quota', 0) / 500000, 2)
+				user_info = {
+					'success': True,
+					'quota': quota,
+					'used_quota': used_quota,
+					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+				}
+				print(user_info['display'])
+				print(f'[SUCCESS] {account_name}: AgentRouter credential login & check-in completed!')
+				return True, user_info, user_info
 		else:
 			print(f'[FAILED] {account_name}: Credential login failed, will not use stale session cookies')
 			return False, None, None

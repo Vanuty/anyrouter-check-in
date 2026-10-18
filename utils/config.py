@@ -154,9 +154,11 @@ class AccountConfig:
 	provider: str = 'anyrouter'
 	name: str | None = None
 	email: str | None = None
+	username: str | None = None
 	password: str | None = None
 	github_session: str | None = None
 	linuxdo_session: str | None = None
+
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
 		"""从字典创建 AccountConfig"""
@@ -173,12 +175,16 @@ class AccountConfig:
 		if not linuxdo_session and isinstance(cookies_val, dict):
 			linuxdo_session = cookies_val.get('_forum_session') or cookies_val.get('linuxdo_session')
 
+		username_val = data.get('username') or data.get('email')
+		email_val = data.get('email') or data.get('username')
+
 		return cls(
 			cookies=cookies_val,
 			api_user=data.get('api_user'),
 			provider=provider,
 			name=name if name else None,
-			email=data.get('email'),
+			email=email_val,
+			username=username_val,
 			password=data.get('password'),
 			github_session=github_session,
 			linuxdo_session=linuxdo_session,
@@ -189,8 +195,9 @@ class AccountConfig:
 		return bool(self.github_session or self.linuxdo_session)
 
 	def has_login_credentials(self) -> bool:
-		"""是否配置了邮箱密码登录"""
-		return bool(self.email and self.password)
+		"""是否配置了邮箱或用户名密码登录"""
+		login_id = self.username or self.email
+		return bool(login_id and self.password)
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
@@ -222,7 +229,7 @@ def load_accounts_config() -> list[AccountConfig] | None:
 				print(f'ERROR: Account {i + 1} configuration format is incorrect')
 				return None
 
-			has_login = bool(account_dict.get('email') and account_dict.get('password'))
+			has_login = bool((account_dict.get('email') or account_dict.get('username')) and account_dict.get('password'))
 			has_oauth = bool(
 				account_dict.get('github_session')
 				or account_dict.get('linuxdo_session')

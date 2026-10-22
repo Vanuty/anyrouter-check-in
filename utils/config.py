@@ -103,7 +103,7 @@ class AppConfig:
 				api_user_key='new-api-user',
 				bypass_method='waf_cookies',
 				waf_cookie_names=['acw_tc'],
-				use_proxy=False,
+				use_proxy=True,
 				persist_profile=False,
 			),
 		}

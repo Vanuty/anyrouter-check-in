@@ -70,7 +70,16 @@ proxy-providers:
       url: https://www.gstatic.com/generate_204
 
 proxy-groups:
-  - name: CHECKIN
+  - name: CHECKIN-SG
+    type: url-test
+    url: "${PROXY_TEST_URL}"
+    interval: 300
+    tolerance: 150
+    lazy: false
+    filter: "(?i)新加坡|SG|Singapore"
+    use:
+      - subscription
+  - name: CHECKIN-ALL
     type: url-test
     url: "${PROXY_TEST_URL}"
     interval: 300
@@ -78,6 +87,14 @@ proxy-groups:
     lazy: false
     use:
       - subscription
+  - name: CHECKIN
+    type: fallback
+    url: "${PROXY_TEST_URL}"
+    interval: 300
+    lazy: false
+    proxies:
+      - CHECKIN-SG
+      - CHECKIN-ALL
 
 rules:
   - MATCH,CHECKIN

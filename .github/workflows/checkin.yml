@@ -1,8 +1,8 @@
 name: AnyRouter 自动签到
 on:
   schedule:
-    # 每天北京时间 08:23 与 23:23 各执行一次（对应 UTC 00:23 与 15:23）
-    - cron: '23 0,15 * * *'
+    # 每天北京时间约 09:05 与 19:05 执行（对应 UTC 01:05 与 11:05，避开全球 00:00/15:00 拥堵时段）
+    - cron: '5 1,11 * * *'
   workflow_dispatch:
     inputs:
       debug:

@@ -53,8 +53,8 @@ jobs:
 
     - name: 安装系统依赖
       run: |
-        sudo apt-get update
-        sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
+        sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout="15"
+        sudo apt-get install -y --no-install-recommends xvfb fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
           fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
 
     - name: 缓存 CloakBrowser 二进制

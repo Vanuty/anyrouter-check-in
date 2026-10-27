@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 通过 mihomo 拉取订阅、启动本地代理并探测可用节点。
-# 环境变量:
-#   CHECKIN_PROXY_URL       已配置的直接代理地址（优先使用）
-#   PROXY_SUBSCRIPTION_URL  订阅链接（必填才启用）
-#   PROXY_TEST_URL          探测目标，默认 https://www.google.com/generate_204
-#   PROXY_REQUIRED          true 时探测失败则退出 1
+# 启动 mihomo 透明代理，优先调度新加坡与香港等低风控免滑块节点。
+# 环境变量支持:
+#   CHECKIN_PROXY_URL       已有的直接代理地址
+#   PROXY_SUBSCRIPTION_URL  订阅链接
+#   PROXY_TEST_URL          测速目标，默认 https://www.gstatic.com/generate_204
+#   PROXY_REQUIRED          true 时测速失败退出 1
 #   PROXY_PORT              本地 mixed-port，默认 7890
 
 set -euo pipefail
@@ -29,8 +29,8 @@ fi
 
 PROXY_DIR="${RUNNER_TEMP:-/tmp}/checkin-proxy"
 PROXY_PORT="${PROXY_PORT:-7890}"
-PROXY_TEST_URL="${PROXY_TEST_URL:-https://www.google.com/generate_204}"
-MIHOMO_VERSION="${MIHOMO_VERSION:-v1.19.0}"
+PROXY_TEST_URL="${PROXY_TEST_URL:-https://www.gstatic.com/generate_204}"
+MIHOMO_VERSION="${MIHOMO_VERSION:-v1.19.27}"
 PROXY_REQUIRED="${PROXY_REQUIRED:-false}"
 
 mkdir -p "${PROXY_DIR}"
@@ -76,7 +76,16 @@ proxy-groups:
     interval: 300
     tolerance: 150
     lazy: false
-    filter: "(?i)新加坡|SG|Singapore"
+    filter: ".*(新加坡|SG|Singapore|🇸🇬).*"
+    use:
+      - subscription
+  - name: CHECKIN-HK
+    type: url-test
+    url: "${PROXY_TEST_URL}"
+    interval: 300
+    tolerance: 150
+    lazy: false
+    filter: ".*(香港|HK|Hong Kong|🇭🇰).*"
     use:
       - subscription
   - name: CHECKIN-ALL
@@ -94,6 +103,7 @@ proxy-groups:
     lazy: false
     proxies:
       - CHECKIN-SG
+      - CHECKIN-HK
       - CHECKIN-ALL
 
 rules:

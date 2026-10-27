@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 启动 mihomo 透明代理，优先调度新加坡与香港等低风控免滑块节点。
+# 启动 mihomo 透明代理，强制调度新加坡低风控免滑块节点。
 # 环境变量支持:
 #   CHECKIN_PROXY_URL       已有的直接代理地址
 #   PROXY_SUBSCRIPTION_URL  订阅链接
@@ -36,6 +36,16 @@ PROXY_REQUIRED="${PROXY_REQUIRED:-false}"
 mkdir -p "${PROXY_DIR}"
 cd "${PROXY_DIR}"
 
+echo "[INFO] Pre-fetching subscription file..."
+if ! curl --retry 3 --retry-delay 3 --retry-all-errors -fsSL -H "User-Agent: ClashMeta" -o subscription.yaml \
+	"${PROXY_SUBSCRIPTION_URL}"; then
+	echo "[WARN] Failed to pre-fetch subscription, skip proxy setup"
+	if [[ "${PROXY_REQUIRED}" == "true" ]]; then
+		exit 1
+	fi
+	exit 0
+fi
+
 echo "[INFO] Downloading mihomo ${MIHOMO_VERSION}..."
 ARCHIVE="mihomo-linux-amd64-${MIHOMO_VERSION}.gz"
 if ! curl --retry 3 --retry-delay 5 --retry-all-errors -fsSL -o "${ARCHIVE}" \
@@ -55,56 +65,29 @@ mixed-port: ${PROXY_PORT}
 allow-lan: false
 ipv6: false
 mode: rule
-log-level: warning
+log-level: info
 unified-delay: true
+external-controller: 127.0.0.1:9090
 
 proxy-providers:
   subscription:
-    type: http
-    url: "${PROXY_SUBSCRIPTION_URL}"
-    interval: 3600
+    type: file
     path: ./subscription.yaml
     health-check:
       enable: true
-      interval: 300
+      interval: 120
       url: https://www.gstatic.com/generate_204
 
 proxy-groups:
-  - name: CHECKIN-SG
-    type: url-test
-    url: "${PROXY_TEST_URL}"
-    interval: 300
-    tolerance: 150
-    lazy: false
-    filter: ".*(新加坡|SG|Singapore|🇸🇬).*"
-    use:
-      - subscription
-  - name: CHECKIN-HK
-    type: url-test
-    url: "${PROXY_TEST_URL}"
-    interval: 300
-    tolerance: 150
-    lazy: false
-    filter: ".*(香港|HK|Hong Kong|🇭🇰).*"
-    use:
-      - subscription
-  - name: CHECKIN-ALL
-    type: url-test
-    url: "${PROXY_TEST_URL}"
-    interval: 300
-    tolerance: 150
-    lazy: false
-    use:
-      - subscription
   - name: CHECKIN
-    type: fallback
+    type: url-test
     url: "${PROXY_TEST_URL}"
-    interval: 300
+    interval: 60
+    tolerance: 50
     lazy: false
-    proxies:
-      - CHECKIN-SG
-      - CHECKIN-HK
-      - CHECKIN-ALL
+    filter: "(?i)新加坡|SG|Singapore"
+    use:
+      - subscription
 
 rules:
   - MATCH,CHECKIN
@@ -117,7 +100,7 @@ echo $! > mihomo.pid
 PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
 READY=false
 for attempt in $(seq 1 45); do
-	if curl -fsS -x "${PROXY_URL}" --max-time 20 "${PROXY_TEST_URL}" -o /dev/null 2>/dev/null; then
+	if curl -fsS -x "${PROXY_URL}" --max-time 15 "${PROXY_TEST_URL}" -o /dev/null 2>/dev/null; then
 		READY=true
 		break
 	fi
@@ -138,6 +121,21 @@ if [[ "${READY}" != "true" ]]; then
 fi
 
 echo "[SUCCESS] Proxy is ready: ${PROXY_URL}"
+
+# Query selected proxy node info from Mihomo REST API
+SELECTED_NODE=$(curl -s "http://127.0.0.1:9090/proxies/CHECKIN" 2>/dev/null | grep -o '"now":"[^"]*"' | cut -d':' -f2 | tr -d '"' || echo "unknown")
+echo "[INFO] Active Singapore Proxy Node: ${SELECTED_NODE}"
+
+# Test and verify outbound IP and Country
+OUTBOUND_INFO=$(curl -s -x "${PROXY_URL}" --max-time 15 "http://ip-api.com/line?fields=country,city,query,isp" 2>/dev/null || echo "unknown")
+echo "[INFO] Outbound Route Details:"
+echo "${OUTBOUND_INFO}"
+
+# Probe AgentRouter web page to verify anti-bot bypass
+echo "[INFO] Probing AgentRouter connectivity via proxy..."
+AR_TITLE=$(curl -s -L -x "${PROXY_URL}" --max-time 15 "https://agentrouter.org" 2>/dev/null | grep -o '<title>[^<]*</title>' || echo "none")
+echo "[INFO] AgentRouter Page Title: ${AR_TITLE}"
+
 echo "[INFO] Proxy is scoped to CHECKIN_PROXY_URL (browser/python only, not global HTTP_PROXY)"
 if [[ -n "${GITHUB_ENV:-}" ]]; then
 	echo "CHECKIN_PROXY_URL=${PROXY_URL}" >> "${GITHUB_ENV}"

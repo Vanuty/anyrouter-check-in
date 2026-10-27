@@ -162,7 +162,13 @@ class AccountConfig:
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
 		"""从字典创建 AccountConfig"""
-		provider = data.get('provider', 'anyrouter')
+		provider = data.get('provider')
+		if not provider:
+			name_lower = str(data.get('name', '')).lower()
+			if 'agentrouter' in name_lower:
+				provider = 'agentrouter'
+			else:
+				provider = 'anyrouter'
 		name = data.get('name', f'Account {index + 1}')
 
 		cookies_val = data.get('cookies')

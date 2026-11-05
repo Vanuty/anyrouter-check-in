@@ -37,7 +37,7 @@ mkdir -p "${PROXY_DIR}"
 cd "${PROXY_DIR}"
 
 echo "[INFO] Pre-fetching subscription file..."
-if ! curl --retry 3 --retry-delay 3 --retry-all-errors -fsSL -H "User-Agent: ClashMeta" -o subscription.yaml \
+if ! curl --retry 3 --retry-delay 3 --retry-all-errors --http1.1 -fsSL -H "User-Agent: ClashMeta" -o subscription.yaml \
 	"${PROXY_SUBSCRIPTION_URL}"; then
 	echo "[WARN] Failed to pre-fetch subscription, skip proxy setup"
 	if [[ "${PROXY_REQUIRED}" == "true" ]]; then

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 启动 mihomo 透明代理，强制调度新加坡低风控免滑块节点。
+# 启动 mihomo 透明代理，强制调度低风控免滑块节点。
 # 环境变量支持:
 #   CHECKIN_PROXY_URL       已有的直接代理地址
 #   PROXY_SUBSCRIPTION_URL  订阅链接
@@ -32,6 +32,10 @@ PROXY_PORT="${PROXY_PORT:-7890}"
 PROXY_TEST_URL="${PROXY_TEST_URL:-https://www.gstatic.com/generate_204}"
 MIHOMO_VERSION="${MIHOMO_VERSION:-v1.19.27}"
 PROXY_REQUIRED="${PROXY_REQUIRED:-false}"
+
+# Detect runner's direct public IP first to prevent any false-positive bypass
+RUNNER_DIRECT_IP=$(curl -s --max-time 6 "https://api.ipify.org" 2>/dev/null || echo "")
+echo "[INFO] Runner direct public IP: ${RUNNER_DIRECT_IP:-unknown}"
 
 mkdir -p "${PROXY_DIR}"
 cd "${PROXY_DIR}"
@@ -117,19 +121,46 @@ nohup "${MIHOMO_BIN}" -d "${PROXY_DIR}" -f config.yaml > mihomo.log 2>&1 &
 echo $! > mihomo.pid
 
 PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
+
+# Trigger immediate parallel latency benchmarks via REST API
+echo "[INFO] Triggering initial proxy group delay benchmarks..."
+sleep 1
+curl -s "http://127.0.0.1:9090/group/CHECKIN_SG/delay?url=${PROXY_TEST_URL}&timeout=4000" >/dev/null 2>&1 || true
+curl -s "http://127.0.0.1:9090/group/CHECKIN_ALL/delay?url=${PROXY_TEST_URL}&timeout=4000" >/dev/null 2>&1 || true
+
 READY=false
-for attempt in $(seq 1 45); do
-	if curl -fsS -x "${PROXY_URL}" --max-time 15 "${PROXY_TEST_URL}" -o /dev/null 2>/dev/null; then
-		READY=true
-		break
+SELECTED_GROUP="none"
+SELECTED_NODE="none"
+
+for attempt in $(seq 1 35); do
+	G_NAME=$(curl -s "http://127.0.0.1:9090/proxies/CHECKIN" 2>/dev/null | python3 -c "import sys, json; print(json.load(sys.stdin).get('now', ''))" 2>/dev/null || echo "")
+	if [[ -n "${G_NAME}" && "${G_NAME}" != "COMPATIBLE" && "${G_NAME}" != "DIRECT" && "${G_NAME}" != "REJECT" ]]; then
+		SELECTED_GROUP="${G_NAME}"
+		N_NAME=$(curl -s "http://127.0.0.1:9090/proxies/${SELECTED_GROUP}" 2>/dev/null | python3 -c "import sys, json; print(json.load(sys.stdin).get('now', ''))" 2>/dev/null || echo "${SELECTED_GROUP}")
+		if [[ -n "${N_NAME}" && "${N_NAME}" != "COMPATIBLE" && "${N_NAME}" != "DIRECT" && "${N_NAME}" != "REJECT" ]]; then
+			SELECTED_NODE="${N_NAME}"
+			# Verify HTTP 204 connectivity through proxy
+			if curl -fsS -x "${PROXY_URL}" --max-time 8 "${PROXY_TEST_URL}" -o /dev/null 2>/dev/null; then
+				# Verify outbound IP is different from runner direct IP (not Azure direct traffic)
+				PROXY_OUTBOUND_IP=$(curl -s -x "${PROXY_URL}" --max-time 8 "https://api.ipify.org" 2>/dev/null || echo "")
+				if [[ -n "${PROXY_OUTBOUND_IP}" && ( -z "${RUNNER_DIRECT_IP}" || "${PROXY_OUTBOUND_IP}" != "${RUNNER_DIRECT_IP}" ) ]]; then
+					READY=true
+					break
+				fi
+			fi
+		fi
 	fi
-	echo "[INFO] Waiting for proxy health check (${attempt}/45)..."
+	echo "[INFO] Waiting for proxy to select active node (${attempt}/35)... (group: ${SELECTED_GROUP}, node: ${SELECTED_NODE})"
+	if (( attempt % 5 == 0 )); then
+		curl -s "http://127.0.0.1:9090/group/CHECKIN_SG/delay?url=${PROXY_TEST_URL}&timeout=4000" >/dev/null 2>&1 || true
+		curl -s "http://127.0.0.1:9090/group/CHECKIN_ALL/delay?url=${PROXY_TEST_URL}&timeout=4000" >/dev/null 2>&1 || true
+	fi
 	sleep 2
 done
 
 if [[ "${READY}" != "true" ]]; then
-	echo "[FAILED] Proxy health check failed for ${PROXY_TEST_URL}"
-	tail -n 30 mihomo.log || true
+	echo "[FAILED] Proxy health check failed: no valid proxy node selected or outbound is direct runner IP"
+	tail -n 40 mihomo.log || true
 	if [[ -f mihomo.pid ]]; then
 		kill "$(cat mihomo.pid)" 2>/dev/null || true
 	fi
@@ -140,10 +171,6 @@ if [[ "${READY}" != "true" ]]; then
 fi
 
 echo "[SUCCESS] Proxy is ready: ${PROXY_URL}"
-
-# Query selected proxy node info from Mihomo REST API
-SELECTED_GROUP=$(curl -s "http://127.0.0.1:9090/proxies/CHECKIN" 2>/dev/null | grep -o '"now":"[^"]*"' | cut -d':' -f2 | tr -d '"' || echo "CHECKIN_SG")
-SELECTED_NODE=$(curl -s "http://127.0.0.1:9090/proxies/${SELECTED_GROUP}" 2>/dev/null | grep -o '"now":"[^"]*"' | cut -d':' -f2 | tr -d '"' || echo "${SELECTED_GROUP}")
 echo "[INFO] Active Proxy Node: ${SELECTED_NODE} (Group: ${SELECTED_GROUP})"
 
 # Test and verify outbound IP and Country

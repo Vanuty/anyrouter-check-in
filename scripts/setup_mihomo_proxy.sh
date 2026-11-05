@@ -50,6 +50,39 @@ if ! curl --retry 5 --retry-delay 3 --retry-all-errors --http1.1 -fsSL -k -H "Us
 	exit 0
 fi
 
+# Filter subscription using Python stdlib: retain clean VMess TCP nodes (low WAF risk, zero UDP drops)
+echo "[INFO] Filtering and optimizing subscription proxy nodes..."
+python3 -c "
+with open('subscription.yaml', 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+new_lines = []
+in_proxies = False
+for line in lines:
+    if line.startswith('proxies:'):
+        in_proxies = True
+        new_lines.append(line)
+        continue
+    if in_proxies:
+        if line.startswith('proxy-groups:') or line.startswith('rules:') or (line and not line.startswith(' ') and not line.startswith('\t')):
+            in_proxies = False
+            new_lines.append(line)
+            continue
+        # Prioritize clean VMess nodes and exclude dummy/status nodes
+        if 'type: vmess' in line and not any(k in line for k in ['剩余', '重置', '到期']):
+            new_lines.append(line)
+    else:
+        new_lines.append(line)
+
+vmess_count = sum(1 for l in new_lines if 'type: vmess' in l)
+if vmess_count > 0:
+    with open('subscription.yaml', 'w', encoding='utf-8') as f:
+        f.writelines(new_lines)
+    print(f'[INFO] Retained {vmess_count} clean VMess proxy nodes (bypassing datacenter/WAF blocks)')
+else:
+    print('[WARN] No VMess nodes detected, keeping original subscription')
+"
+
 echo "[INFO] Downloading mihomo ${MIHOMO_VERSION}..."
 ARCHIVE="mihomo-linux-amd64-${MIHOMO_VERSION}.gz"
 if ! curl --retry 3 --retry-delay 5 --retry-all-errors -fsSL -o "${ARCHIVE}" \

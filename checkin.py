@@ -454,14 +454,28 @@ async def run_agentrouter_browser_oauth_checkin(
 ) -> tuple[bool, dict | None, dict | None]:
 	"""使用浏览器沙盒直连 AgentRouter，在已过 WAF 页面内部静默执行 OAuth 换码与签到。"""
 	print(f'[PROCESSING] {account_name}: Starting browser for in-page OAuth silent check-in...')
-	launch_kwargs: dict = {'headless': True}
-	proxy = get_playwright_proxy(use_proxy=provider_config.use_proxy)
-	if proxy:
-		launch_kwargs['proxy'] = proxy
-	browser = await launch_async(**launch_kwargs)
+	provider_name = provider_config.name or 'agentrouter'
+	login_url = f'{provider_config.domain}{provider_config.login_path}'
+	settings = load_browser_login_settings(
+		account_name,
+		provider_name,
+		persist_profile=provider_config.persist_profile,
+	)
+	timeout_ms = settings.wait_timeout_ms
+
+	print(
+		f'[INFO] {account_name}: Provider proxy={"enabled" if provider_config.use_proxy else "disabled"} '
+		f'({provider_name})'
+	)
 
 	try:
-		context = await browser.new_context()
+		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+		return False, None, None
+
+	page = None
+	try:
 		# 若已有 cookies (如 session)，注入浏览器上下文
 		user_cookies = parse_cookies(account.cookies)
 		if user_cookies:
@@ -478,9 +492,13 @@ async def run_agentrouter_browser_oauth_checkin(
 
 		page = await context.new_page()
 		await prepare_browser_page(page)
-		login_url = f'{provider_config.domain}{provider_config.login_path}'
-		await page.goto(login_url, wait_until='domcontentloaded')
-		await wait_for_waf_ready(page)
+		await navigate_login_page(
+			page,
+			login_url,
+			timeout_ms,
+			provider=provider_name,
+			account_name=account_name,
+		)
 
 		# 1. 优先尝试直接用现有 session 查询（若有效直接秒级闭环）
 		api_user_header = account.api_user or ''
@@ -488,7 +506,8 @@ async def run_agentrouter_browser_oauth_checkin(
 			try {
 				const headers = uid ? {'new-api-user': String(uid)} : {};
 				const r = await fetch('/api/user/self', { headers });
-				return await r.json();
+				const t = await r.text();
+				try { return JSON.parse(t); } catch (_) { return { success: false, error: t.slice(0, 100) }; }
 			} catch (e) {
 				return { success: false, error: String(e) };
 			}
@@ -507,27 +526,33 @@ async def run_agentrouter_browser_oauth_checkin(
 			}
 			print(user_info['display'])
 			print(f'[SUCCESS] {account_name}: AgentRouter session verified & check-in completed!')
-			await browser.close()
+			await context.close()
 			return True, user_info, user_info
 
 		# 2. 若未登录且配置了 OAuth 会话，进行静默 OAuth 流程
 		if not account.has_oauth_session():
 			print(f'[FAILED] {account_name}: No active session and no OAuth session configured')
-			await browser.close()
+			await context.close()
 			return False, None, None
 
 		js_init = '''async () => {
 			try {
 				const sReq = await fetch('/api/status');
-				const sData = await sReq.json();
+				const sText = await sReq.text();
+				let sData = {};
+				try { sData = JSON.parse(sText); } catch (_) {}
+
 				const stReq = await fetch('/api/oauth/state?mode=login');
-				const stData = await stReq.json();
+				const stText = await stReq.text();
+				let stData = {};
+				try { stData = JSON.parse(stText); } catch (_) {}
+
 				return {
 					success: stData?.success && !!stData?.data,
 					state: stData?.data,
 					github_client_id: sData?.data?.github_client_id,
 					linuxdo_client_id: sData?.data?.linuxdo_client_id,
-					error: stData?.message || 'Failed to fetch oauth state',
+					error: stData?.message || (stText.startsWith('<!') ? 'WAF challenge blocking API' : 'Failed to fetch oauth state'),
 				};
 			} catch (e) {
 				return { success: false, error: String(e) };
@@ -537,7 +562,9 @@ async def run_agentrouter_browser_oauth_checkin(
 
 		if not oauth_init.get('success') or not oauth_init.get('state'):
 			print(f'[FAILED] {account_name}: In-page OAuth state fetch failed: {oauth_init.get("error")}')
-			await browser.close()
+			if page is not None:
+				await save_login_screenshot(page, provider_name, account_name, 'oauth-state-error')
+			await context.close()
 			return False, None, None
 
 		state = oauth_init['state']
@@ -555,7 +582,7 @@ async def run_agentrouter_browser_oauth_checkin(
 			oauth_provider = 'linuxdo'
 			code = await oauth_client.authorize_linuxdo(account.linuxdo_session, state, use_proxy=provider_config.use_proxy)
 		else:
-			await browser.close()
+			await context.close()
 			return False, None, None
 
 		# 3. 页面内部执行 OAuth 回调登录
@@ -563,7 +590,8 @@ async def run_agentrouter_browser_oauth_checkin(
 			try {
 				const endpoint = '/api/oauth/' + args.provider + '?code=' + encodeURIComponent(args.code) + '&state=' + encodeURIComponent(args.state) + '&mode=login';
 				const r = await fetch(endpoint);
-				return await r.json();
+				const t = await r.text();
+				try { return JSON.parse(t); } catch (_) { return { success: false, error: t.slice(0, 100) }; }
 			} catch (e) {
 				return { success: false, error: String(e) };
 			}
@@ -572,7 +600,9 @@ async def run_agentrouter_browser_oauth_checkin(
 
 		if not login_res.get('success'):
 			print(f'[FAILED] {account_name}: OAuth login callback failed: {login_res.get("message")}')
-			await browser.close()
+			if page is not None:
+				await save_login_screenshot(page, provider_name, account_name, 'oauth-callback-error')
+			await context.close()
 			return False, None, None
 
 		# 4. 页面内部查询最新用户余额
@@ -590,16 +620,17 @@ async def run_agentrouter_browser_oauth_checkin(
 		}
 		print(user_info['display'])
 		print(f'[SUCCESS] {account_name}: AgentRouter OAuth silent check-in completed!')
-		await browser.close()
+		await context.close()
 		return True, user_info, user_info
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Browser OAuth check-in error: {e}')
-		try:
-			await browser.close()
-		except Exception:
-			pass
+		if page is not None:
+			await save_login_screenshot(page, provider_name, account_name, 'oauth-error')
+		if context is not None:
+			await context.close()
 		return False, None, None
+
 
 
 async def run_agentrouter_oauth_checkin(

@@ -40,7 +40,7 @@ from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
 
 from utils.headers import get_browser_headers
-from utils.oauth_agentrouter import AgentRouterOAuthClient
+from utils.oauth_agentrouter import AgentRouterOAuthClient, DEFAULT_GITHUB_CLIENT_ID, DEFAULT_LINUXDO_CLIENT_ID
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
@@ -390,13 +390,9 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
-	if account.provider == 'agentrouter' and account.has_oauth_session():
-		print(f'[INFO] {account_name}: Using OAuth silent authentication for AgentRouter (Bypassing Baxia WAF)...')
-		user_cookies = parse_cookies(account.cookies)
-		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
-		if not all_cookies:
-			return False, None, None
-		return await run_agentrouter_oauth_checkin(all_cookies, account, account_name, provider_config)
+	if account.provider == 'agentrouter' and (account.has_oauth_session() or account.cookies):
+		print(f'[INFO] {account_name}: Using in-page silent authentication for AgentRouter (Bypassing Baxia WAF)...')
+		return await run_agentrouter_browser_oauth_checkin(account, account_name, provider_config)
 	elif account.has_login_credentials():
 		login_id = account.username or account.email
 		print(f'[INFO] {account_name}: Attempting credential login ({login_id}) (priority)...')
@@ -449,6 +445,161 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		api_user_override=resolved_api_user,
 		use_proxy=provider_config.use_proxy,
 	)
+
+
+async def run_agentrouter_browser_oauth_checkin(
+	account: AccountConfig,
+	account_name: str,
+	provider_config,
+) -> tuple[bool, dict | None, dict | None]:
+	"""使用浏览器沙盒直连 AgentRouter，在已过 WAF 页面内部静默执行 OAuth 换码与签到。"""
+	print(f'[PROCESSING] {account_name}: Starting browser for in-page OAuth silent check-in...')
+	launch_kwargs: dict = {'headless': True}
+	proxy = get_playwright_proxy(use_proxy=provider_config.use_proxy)
+	if proxy:
+		launch_kwargs['proxy'] = proxy
+	browser = await launch_async(**launch_kwargs)
+
+	try:
+		context = await browser.new_context()
+		# 若已有 cookies (如 session)，注入浏览器上下文
+		user_cookies = parse_cookies(account.cookies)
+		if user_cookies:
+			domain_clean = provider_config.domain.replace('https://', '').replace('http://', '').split('/')[0]
+			await context.add_cookies([
+				{
+					'name': k,
+					'value': v,
+					'domain': domain_clean,
+					'path': '/',
+				}
+				for k, v in user_cookies.items()
+			])
+
+		page = await context.new_page()
+		await prepare_browser_page(page)
+		login_url = f'{provider_config.domain}{provider_config.login_path}'
+		await page.goto(login_url, wait_until='domcontentloaded')
+		await wait_for_waf_ready(page)
+
+		# 1. 优先尝试直接用现有 session 查询（若有效直接秒级闭环）
+		api_user_header = account.api_user or ''
+		js_user = '''async (uid) => {
+			try {
+				const headers = uid ? {'new-api-user': String(uid)} : {};
+				const r = await fetch('/api/user/self', { headers });
+				return await r.json();
+			} catch (e) {
+				return { success: false, error: String(e) };
+			}
+		}'''
+		initial_user = await page.evaluate(js_user, api_user_header)
+
+		if initial_user.get('success') and initial_user.get('data'):
+			u = initial_user['data']
+			quota = round(u.get('quota', 0) / 500000, 2)
+			used_quota = round(u.get('used_quota', 0) / 500000, 2)
+			user_info = {
+				'success': True,
+				'quota': quota,
+				'used_quota': used_quota,
+				'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+			}
+			print(user_info['display'])
+			print(f'[SUCCESS] {account_name}: AgentRouter session verified & check-in completed!')
+			await browser.close()
+			return True, user_info, user_info
+
+		# 2. 若未登录且配置了 OAuth 会话，进行静默 OAuth 流程
+		if not account.has_oauth_session():
+			print(f'[FAILED] {account_name}: No active session and no OAuth session configured')
+			await browser.close()
+			return False, None, None
+
+		js_init = '''async () => {
+			try {
+				const sReq = await fetch('/api/status');
+				const sData = await sReq.json();
+				const stReq = await fetch('/api/oauth/state?mode=login');
+				const stData = await stReq.json();
+				return {
+					success: stData?.success && !!stData?.data,
+					state: stData?.data,
+					github_client_id: sData?.data?.github_client_id,
+					linuxdo_client_id: sData?.data?.linuxdo_client_id,
+					error: stData?.message || 'Failed to fetch oauth state',
+				};
+			} catch (e) {
+				return { success: false, error: String(e) };
+			}
+		}'''
+		oauth_init = await page.evaluate(js_init)
+
+		if not oauth_init.get('success') or not oauth_init.get('state'):
+			print(f'[FAILED] {account_name}: In-page OAuth state fetch failed: {oauth_init.get("error")}')
+			await browser.close()
+			return False, None, None
+
+		state = oauth_init['state']
+		oauth_client = AgentRouterOAuthClient(
+			domain=provider_config.domain,
+			github_client_id=oauth_init.get('github_client_id') or DEFAULT_GITHUB_CLIENT_ID,
+			linuxdo_client_id=oauth_init.get('linuxdo_client_id') or DEFAULT_LINUXDO_CLIENT_ID,
+		)
+
+		proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
+		if account.github_session:
+			oauth_provider = 'github'
+			code = oauth_client.authorize_github(account.github_session, state, proxy_url=proxy_url)
+		elif account.linuxdo_session:
+			oauth_provider = 'linuxdo'
+			code = await oauth_client.authorize_linuxdo(account.linuxdo_session, state, use_proxy=provider_config.use_proxy)
+		else:
+			await browser.close()
+			return False, None, None
+
+		# 3. 页面内部执行 OAuth 回调登录
+		js_login = '''async (args) => {
+			try {
+				const endpoint = '/api/oauth/' + args.provider + '?code=' + encodeURIComponent(args.code) + '&state=' + encodeURIComponent(args.state) + '&mode=login';
+				const r = await fetch(endpoint);
+				return await r.json();
+			} catch (e) {
+				return { success: false, error: String(e) };
+			}
+		}'''
+		login_res = await page.evaluate(js_login, {'provider': oauth_provider, 'code': code, 'state': state})
+
+		if not login_res.get('success'):
+			print(f'[FAILED] {account_name}: OAuth login callback failed: {login_res.get("message")}')
+			await browser.close()
+			return False, None, None
+
+		# 4. 页面内部查询最新用户余额
+		uid = str(login_res.get('data', {}).get('id') or account.api_user or '')
+		user_res = await page.evaluate(js_user, uid)
+
+		user_data = user_res.get('data') or login_res.get('data') or {}
+		quota = round(user_data.get('quota', 0) / 500000, 2)
+		used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+		user_info = {
+			'success': True,
+			'quota': quota,
+			'used_quota': used_quota,
+			'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+		}
+		print(user_info['display'])
+		print(f'[SUCCESS] {account_name}: AgentRouter OAuth silent check-in completed!')
+		await browser.close()
+		return True, user_info, user_info
+
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser OAuth check-in error: {e}')
+		try:
+			await browser.close()
+		except Exception:
+			pass
+		return False, None, None
 
 
 async def run_agentrouter_oauth_checkin(

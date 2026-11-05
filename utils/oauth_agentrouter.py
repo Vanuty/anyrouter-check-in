@@ -152,8 +152,9 @@ class AgentRouterOAuthClient:
 			logger.debug(f'动态获取 OAuth client_id 失败，使用内置默认 ID: {e}')
 
 		# 临时保存已有 cookies，用干净上下文获取 state
-		saved_cookies = list(client.cookies.jar)
-		client.cookies.clear()
+		saved_session = client.cookies.get('session')
+		if 'session' in client.cookies:
+			del client.cookies['session']
 		try:
 			url = f'{self.domain}/api/oauth/state'
 			params = {'mode': 'login'}
@@ -169,8 +170,8 @@ class AgentRouterOAuthClient:
 				raise RuntimeError(f'获取 OAuth state 失败: {body.get("message")}')
 			return str(body['data'])
 		finally:
-			for c in saved_cookies:
-				client.cookies.jar.set_cookie(c)
+			if saved_session:
+				client.cookies.set('session', saved_session)
 
 	def authorize_github(
 		self,

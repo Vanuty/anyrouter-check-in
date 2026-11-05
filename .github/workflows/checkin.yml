@@ -148,7 +148,7 @@ jobs:
         path: checkin_screenshots/
         if-no-files-found: warn
         include-hidden-files: true
-        retention-days: 14
+        retention-days: 1
 
     - name: 停止代理
       if: always()

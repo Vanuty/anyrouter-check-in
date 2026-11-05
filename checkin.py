@@ -386,11 +386,18 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
-	# 凭据登录优先（支持 email 或 username）
+	# AgentRouter 优先走 OAuth 静默免滑块鉴权
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
-	if account.has_login_credentials():
+	if account.provider == 'agentrouter' and account.has_oauth_session():
+		print(f'[INFO] {account_name}: Using OAuth silent authentication for AgentRouter (Bypassing Baxia WAF)...')
+		user_cookies = parse_cookies(account.cookies)
+		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
+		if not all_cookies:
+			return False, None, None
+		return await run_agentrouter_oauth_checkin(all_cookies, account, account_name, provider_config)
+	elif account.has_login_credentials():
 		login_id = account.username or account.email
 		print(f'[INFO] {account_name}: Attempting credential login ({login_id}) (priority)...')
 		assert login_id is not None and account.password is not None
@@ -421,13 +428,6 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		else:
 			print(f'[FAILED] {account_name}: Credential login failed, will not use stale session cookies')
 			return False, None, None
-	elif account.provider == 'agentrouter' and account.has_oauth_session():
-		print(f'[INFO] {account_name}: Attempting OAuth silent re-login for AgentRouter...')
-		user_cookies = parse_cookies(account.cookies)
-		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
-		if not all_cookies:
-			return False, None, None
-		return await run_agentrouter_oauth_checkin(all_cookies, account, account_name, provider_config)
 	else:
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
@@ -497,10 +497,10 @@ async def run_agentrouter_oauth_checkin(
 				)
 			elif account.linuxdo_session:
 				oauth_provider = 'linuxdo'
-				code = oauth_client.authorize_linuxdo(
+				code = await oauth_client.authorize_linuxdo(
 					account.linuxdo_session,
 					state,
-					proxy_url=proxy_url,
+					use_proxy=provider_config.use_proxy,
 				)
 			else:
 				print(f'[FAILED] {account_name}: Missing OAuth session token')

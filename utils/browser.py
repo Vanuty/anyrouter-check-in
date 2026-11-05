@@ -228,9 +228,23 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 		settings.profile_dir.mkdir(parents=True, exist_ok=True)
 		return await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs)
 
-	from cloakbrowser import launch_context_async
+	try:
+		from cloakbrowser import launch_context_async
 
-	return await launch_context_async(**launch_kwargs)
+		return await launch_context_async(**launch_kwargs)
+	except ImportError:
+		from cloakbrowser import launch_async
+
+		browser = await launch_async(**launch_kwargs)
+		context = await browser.new_context()
+		orig_close = context.close
+
+		async def _close_with_browser():
+			await orig_close()
+			await browser.close()
+
+		context.close = _close_with_browser
+		return context
 
 
 def get_screenshot_dir() -> Path:

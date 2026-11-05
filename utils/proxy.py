@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 def get_proxy_server(*, use_proxy: bool = True) -> str | None:
@@ -28,6 +28,6 @@ def get_playwright_proxy(*, use_proxy: bool = True) -> dict[str, str] | None:
 		host = f'{host}:{parsed.port}'
 	return {
 		'server': urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment)),
-		'username': parsed.username,
-		'password': parsed.password or '',
+		'username': unquote(parsed.username),
+		'password': unquote(parsed.password or ''),
 	}

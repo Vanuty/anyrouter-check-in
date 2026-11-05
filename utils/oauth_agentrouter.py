@@ -1,24 +1,41 @@
-"""AgentRouter OAuth 静默鉴权与签到重登引擎"""
+"""AgentRouter OAuth 静默鉴权与签到重登引擎。
+
+AgentRouter 没有独立的签到按钮/接口，额度只在 OAuth 登录/鉴权回调中由服务端自动发放。
+本模块通过第三方平台（GitHub / Linux DO）静默换取授权码 code，直连回调接口触发发奖，
+彻底规避阿里云 ESA WAF 的 Web 登录页霸下滑块拦截，并将执行耗时从数分钟压缩至秒级。
+"""
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Mapping
-from urllib.parse import parse_qs, urlparse
+import time
+from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
+from cloakbrowser import launch_async
 
+from utils.browser import prepare_browser_page
 from utils.headers import get_browser_headers
+from utils.proxy import get_playwright_proxy
 
 logger = logging.getLogger(__name__)
 
-# 官方客户端 ID
+# 官方客户端 ID 默认备用值
 DEFAULT_GITHUB_CLIENT_ID = 'Ov23lidtiR4LeVZvVRNL'
 DEFAULT_LINUXDO_CLIENT_ID = 'KZUecGfhhDZMVnv8UtEdhOhf9sNOhqVX'
 
 GITHUB_HOST = 'https://github.com'
+LINUXDO_HOST = 'https://linux.do'
 LINUXDO_CONNECT_HOST = 'https://connect.linux.do'
+LINUXDO_CALLBACK_PATH = '/oauth/linuxdo'
+
+CF_WAIT_ROUNDS = 20
+CF_WAIT_MS = 2000
+GOTO_ATTEMPTS = 3
+RATE_LIMIT_ATTEMPTS = 4
+RATE_LIMIT_BACKOFF_SECONDS = 10
 
 
 def build_github_cookies(session_value: str) -> dict[str, str]:
@@ -33,7 +50,7 @@ def build_github_cookies(session_value: str) -> dict[str, str]:
 
 
 def extract_code_from_location(location: str | None) -> str | None:
-	"""从 302 重定向 Location 中提取授权码 code。"""
+	"""从 302 重定向 Location 中提取授权码 code；跳回登录页说明会话已失效。"""
 	if not location or 'code=' not in location:
 		return None
 	if location.startswith(f'{GITHUB_HOST}/login') or '/login' in location:
@@ -43,8 +60,47 @@ def extract_code_from_location(location: str | None) -> str | None:
 	return codes[0] if codes else None
 
 
+def parse_cookie_string(cookie_str: str) -> dict[str, str]:
+	"""解析形如 'name1=val1; name2=val2' 或单值形式，保留值原样。"""
+	pairs: dict[str, str] = {}
+	if not cookie_str:
+		return pairs
+	text = cookie_str.strip()
+	if '=' not in text:
+		# 单一 token 默认归入 _t
+		return {'_t': text}
+	for part in text.split(';'):
+		name, sep, val = part.strip().partition('=')
+		if sep and name:
+			pairs[name.strip()] = val.strip()
+	return pairs
+
+
+async def _goto_with_retry(page, url: str) -> None:
+	for attempt in range(GOTO_ATTEMPTS):
+		try:
+			await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+			return
+		except Exception:
+			if attempt == GOTO_ATTEMPTS - 1:
+				raise
+			await page.wait_for_timeout(3000)
+
+
+async def _wait_out_challenge(page) -> None:
+	"""等待 Cloudflare 挑战页（'请稍候…' 或 'Just a moment'）跳转。"""
+	for _ in range(CF_WAIT_ROUNDS):
+		try:
+			title = await page.title()
+		except Exception:
+			title = ''
+		if title and '请稍候' not in title and 'Just a moment' not in title:
+			return
+		await page.wait_for_timeout(CF_WAIT_MS)
+
+
 class AgentRouterOAuthClient:
-	"""AgentRouter OAuth 静默登录客户端"""
+	"""AgentRouter OAuth 静默鉴权客户端"""
 
 	def __init__(
 		self,
@@ -59,26 +115,62 @@ class AgentRouterOAuthClient:
 		self.github_client_id = github_client_id
 		self.linuxdo_client_id = linuxdo_client_id
 
-	def fetch_oauth_state(self, client: httpx.Client) -> str:
-		"""请求平台获取签名 OAuth state。"""
-		url = f'{self.domain}/api/oauth/state'
+	def _get_json_with_retry(self, client: httpx.Client, url: str, *, params: dict | None = None) -> dict:
+		"""请求 JSON 并处理 AgentRouter 429 限流指数退避。"""
 		headers = get_browser_headers(domain=self.domain)
-		resp = client.get(url, headers=headers)
-		if resp.status_code != 200:
-			# 备用域名降级重试
-			fallback_url = f'{self.backup_domain}/api/oauth/state'
-			resp = client.get(fallback_url, headers=get_browser_headers(domain=self.backup_domain))
-			if resp.status_code == 200:
-				self.domain = self.backup_domain
+		for attempt in range(RATE_LIMIT_ATTEMPTS):
+			resp = client.get(url, params=params, headers=headers)
+			if resp.status_code != 429:
+				resp.raise_for_status()
+				try:
+					return resp.json()
+				except Exception as e:
+					raise RuntimeError(f'响应非有效 JSON (HTTP {resp.status_code}): {resp.text[:120]}') from e
+			if attempt == RATE_LIMIT_ATTEMPTS - 1:
+				raise RuntimeError(f'AgentRouter 限流 (429)，重试多次后仍未恢复: {url}')
+			backoff = RATE_LIMIT_BACKOFF_SECONDS * (attempt + 1)
+			print(f'[WARN] AgentRouter 429 限流，等待 {backoff} 秒后重试...')
+			time.sleep(backoff)
+		return {}
 
-		resp.raise_for_status()
+	def fetch_oauth_state(self, client: httpx.Client) -> str:
+		"""请求平台获取签名 OAuth state。
+
+		带上旧 session 请求 state 会被服务端判定为 'state is empty or not same'，
+		因此在此步骤强制使用干净的临时 Cookie 会话。
+		"""
+		# 尝试从 /api/status 动态刷新客户端 ID
 		try:
-			body = resp.json()
+			status_url = f'{self.domain}/api/status'
+			status_body = self._get_json_with_retry(client, status_url)
+			data = status_body.get('data') or {}
+			if data.get('github_client_id'):
+				self.github_client_id = data['github_client_id']
+			if data.get('linuxdo_client_id'):
+				self.linuxdo_client_id = data['linuxdo_client_id']
 		except Exception as e:
-			raise RuntimeError(f'获取 OAuth state 响应非 JSON (HTTP {resp.status_code}): {resp.text[:120]}')
-		if not body.get('success') or not body.get('data'):
-			raise RuntimeError(f'获取 OAuth state 失败: {body.get("message")}')
-		return str(body['data'])
+			logger.debug(f'动态获取 OAuth client_id 失败，使用内置默认 ID: {e}')
+
+		# 临时保存已有 cookies，用干净上下文获取 state
+		saved_cookies = list(client.cookies.jar)
+		client.cookies.clear()
+		try:
+			url = f'{self.domain}/api/oauth/state'
+			params = {'mode': 'login'}
+			try:
+				body = self._get_json_with_retry(client, url, params=params)
+			except Exception:
+				# 备用源站镜像降级
+				self.domain = self.backup_domain
+				url = f'{self.domain}/api/oauth/state'
+				body = self._get_json_with_retry(client, url, params=params)
+
+			if not body.get('success') or not body.get('data'):
+				raise RuntimeError(f'获取 OAuth state 失败: {body.get("message")}')
+			return str(body['data'])
+		finally:
+			for c in saved_cookies:
+				client.cookies.jar.set_cookie(c)
 
 	def authorize_github(
 		self,
@@ -87,7 +179,7 @@ class AgentRouterOAuthClient:
 		*,
 		proxy_url: str | None = None,
 	) -> str:
-		"""通过 GitHub 携带 user_session 申请授权并静默提取 code。"""
+		"""通过 GitHub 携带 user_session 申请授权并静默提取 code（耗时 <1 秒）。"""
 		client_kwargs: dict[str, Any] = {'follow_redirects': False, 'timeout': 30.0}
 		if proxy_url:
 			client_kwargs['proxy'] = proxy_url
@@ -108,7 +200,6 @@ class AgentRouterOAuthClient:
 			if code:
 				return code
 
-			# 检查页面内容中的跳转链接、meta refresh 或页面内嵌入的 code
 			if 'code=' in resp.text:
 				code_match = re.search(r'code=([a-zA-Z0-9_-]+)', resp.text)
 				if code_match:
@@ -116,8 +207,9 @@ class AgentRouterOAuthClient:
 
 			if resp.status_code in (301, 302, 303):
 				if location.startswith(f'{GITHUB_HOST}/login'):
-					raise RuntimeError('GitHub 登录态无效或已过期，请更新 github_session')
-				raise RuntimeError(f'GitHub 未返回授权码，跳转地址: {location[:150]}')
+					raise RuntimeError('GitHub 会话已失效（跳转至登录页），请更新 github_session')
+				raise RuntimeError(f'GitHub 未返回授权码，重定向地址: {location[:150]}')
+
 			# 首次授权表单处理
 			if resp.status_code == 200 and 'action=' in resp.text:
 				action_match = re.search(r'<form[^>]+action="([^"]+)"', resp.text)
@@ -142,38 +234,86 @@ class AgentRouterOAuthClient:
 
 			title_m = re.search(r'<title>(.*?)</title>', resp.text, re.I)
 			title = title_m.group(1) if title_m else 'No title'
-			forms = re.findall(r'<form[^>]*>', resp.text, re.I)
-			sample_text = re.sub(r'\s+', ' ', resp.text[:1000])
-			raise RuntimeError(f'未能从 GitHub 获取授权码 (HTTP {resp.status_code}, title: {title}, forms: {forms}): {sample_text}')
-	def authorize_linuxdo(
+			sample_text = re.sub(r'\s+', ' ', resp.text[:400])
+			raise RuntimeError(f'未能从 GitHub 获取授权码 (HTTP {resp.status_code}, title: {title}): {sample_text}')
+
+	async def authorize_linuxdo(
 		self,
 		linuxdo_session_token: str,
 		state: str,
 		*,
-		proxy_url: str | None = None,
+		use_proxy: bool = False,
 	) -> str:
-		"""通过 LinuxDo 携带会话申请授权并静默提取 code。"""
-		client_kwargs: dict[str, Any] = {'follow_redirects': False, 'timeout': 30.0}
-		if proxy_url:
-			client_kwargs['proxy'] = proxy_url
+		"""通过 CloakBrowser 穿透 Cloudflare 质询并靶向截获 Linux DO 授权码。"""
+		cookies = parse_cookie_string(linuxdo_session_token)
+		if not cookies:
+			raise RuntimeError('linuxdo_session 格式无效，请提供 _t 或 _forum_session')
 
-		cookies = {'_forum_session': linuxdo_session_token}
-		headers = get_browser_headers(domain=LINUXDO_CONNECT_HOST)
-		authorize_url = f'{LINUXDO_CONNECT_HOST}/oauth/authorize'
-		params = {
-			'client_id': self.linuxdo_client_id,
-			'state': state,
-			'response_type': 'code',
-		}
+		launch_kwargs: dict[str, Any] = {'headless': True}
+		proxy = get_playwright_proxy(use_proxy=use_proxy)
+		if proxy:
+			launch_kwargs['proxy'] = proxy
 
-		with httpx.Client(**client_kwargs) as client:
-			resp = client.get(authorize_url, params=params, cookies=cookies, headers=headers)
-			location = resp.headers.get('location') or ''
-			code = extract_code_from_location(location)
-			if code:
-				return code
-			sample_text = re.sub(r'\s+', ' ', resp.text[:300])
-			raise RuntimeError(f'未能从 LinuxDo 获取授权码 (HTTP {resp.status_code}, url: {resp.url}, loc: {location}): {sample_text}')
+		browser = await launch_async(**launch_kwargs)
+		captured: list[str] = []
+
+		async def capture(route) -> None:
+			c = extract_code_from_location(route.request.url)
+			if c:
+				captured.append(c)
+				await route.abort()
+			else:
+				await route.continue_()
+
+		try:
+			context = await browser.new_context()
+			# 种到父域 .linux.do
+			await context.add_cookies([
+				{
+					'name': name,
+					'value': value,
+					'domain': '.linux.do',
+					'path': '/',
+					'secure': True,
+					'httpOnly': True,
+				}
+				for name, value in cookies.items()
+			])
+
+			page = await context.new_page()
+			await page.route(f'**{LINUXDO_CALLBACK_PATH}**', capture)
+			await prepare_browser_page(page)
+
+			# 先访问 linux.do 过 Cloudflare 质询拿 cf_clearance
+			await _goto_with_retry(page, f'{LINUXDO_HOST}/')
+			await _wait_out_challenge(page)
+
+			# 跳转授权申请
+			params = {
+				'response_type': 'code',
+				'client_id': self.linuxdo_client_id,
+				'state': state,
+			}
+			await _goto_with_retry(page, f'{LINUXDO_CONNECT_HOST}/oauth2/authorize?{urlencode(params)}')
+
+			approved = False
+			for _ in range(CF_WAIT_ROUNDS):
+				if captured:
+					return captured[0]
+				if not approved:
+					approve = page.locator('a[href*="/oauth2/approve/"]')
+					if await approve.count():
+						await approve.first.click()
+						approved = True
+				await page.wait_for_timeout(CF_WAIT_MS)
+				if page.url.startswith(f'{LINUXDO_HOST}/login'):
+					raise RuntimeError('Linux DO 会话已失效（被跳转至登录页），请更新 linuxdo_session')
+
+			if captured:
+				return captured[0]
+			raise RuntimeError(f'Linux DO 未能获取授权码（停在 {page.url[:60]}）')
+		finally:
+			await browser.close()
 
 	def callback_login(
 		self,
@@ -186,17 +326,8 @@ class AgentRouterOAuthClient:
 		"""携带授权码触发 AgentRouter 登录回调以激活签到发奖。"""
 		url = f'{self.domain}/api/oauth/{provider}'
 		params = {'code': code, 'state': state, 'mode': 'login'}
-		headers = get_browser_headers(domain=self.domain)
 
-		resp = client.get(url, params=params, headers=headers)
-		if resp.status_code != 200:
-			return False, {}, False, f'OAuth 回调失败 (HTTP {resp.status_code})'
-
-		try:
-			body = resp.json()
-		except Exception as e:
-			return False, {}, False, f'解析回调响应失败: {e}'
-
+		body = self._get_json_with_retry(client, url, params=params)
 		if not body.get('success'):
 			return False, {}, False, body.get('message', 'OAuth 回调登录失败')
 

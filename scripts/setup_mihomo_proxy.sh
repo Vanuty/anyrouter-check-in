@@ -37,7 +37,7 @@ mkdir -p "${PROXY_DIR}"
 cd "${PROXY_DIR}"
 
 echo "[INFO] Pre-fetching subscription file..."
-if ! curl --retry 3 --retry-delay 3 --retry-all-errors --http1.1 -fsSL -H "User-Agent: ClashMeta" -o subscription.yaml \
+if ! curl --retry 5 --retry-delay 3 --retry-all-errors --http1.1 -fsSL -k -H "User-Agent: ClashMeta" -o subscription.yaml \
 	"${PROXY_SUBSCRIPTION_URL}"; then
 	echo "[WARN] Failed to pre-fetch subscription, skip proxy setup"
 	if [[ "${PROXY_REQUIRED}" == "true" ]]; then
@@ -79,7 +79,7 @@ proxy-providers:
       url: https://www.gstatic.com/generate_204
 
 proxy-groups:
-  - name: CHECKIN
+  - name: CHECKIN_SG
     type: url-test
     url: "${PROXY_TEST_URL}"
     interval: 60
@@ -88,6 +88,25 @@ proxy-groups:
     filter: "(?i)新加坡|SG|Singapore"
     use:
       - subscription
+
+  - name: CHECKIN_ALL
+    type: url-test
+    url: "${PROXY_TEST_URL}"
+    interval: 60
+    tolerance: 50
+    lazy: false
+    filter: "(?i)新加坡|SG|Singapore|香港|HK|Hong|日本|JP|Japan|台湾|TW|Taiwan|美国|US|America"
+    use:
+      - subscription
+
+  - name: CHECKIN
+    type: fallback
+    url: "${PROXY_TEST_URL}"
+    interval: 60
+    lazy: false
+    proxies:
+      - CHECKIN_SG
+      - CHECKIN_ALL
 
 rules:
   - MATCH,CHECKIN
@@ -123,8 +142,9 @@ fi
 echo "[SUCCESS] Proxy is ready: ${PROXY_URL}"
 
 # Query selected proxy node info from Mihomo REST API
-SELECTED_NODE=$(curl -s "http://127.0.0.1:9090/proxies/CHECKIN" 2>/dev/null | grep -o '"now":"[^"]*"' | cut -d':' -f2 | tr -d '"' || echo "unknown")
-echo "[INFO] Active Singapore Proxy Node: ${SELECTED_NODE}"
+SELECTED_GROUP=$(curl -s "http://127.0.0.1:9090/proxies/CHECKIN" 2>/dev/null | grep -o '"now":"[^"]*"' | cut -d':' -f2 | tr -d '"' || echo "CHECKIN_SG")
+SELECTED_NODE=$(curl -s "http://127.0.0.1:9090/proxies/${SELECTED_GROUP}" 2>/dev/null | grep -o '"now":"[^"]*"' | cut -d':' -f2 | tr -d '"' || echo "${SELECTED_GROUP}")
+echo "[INFO] Active Proxy Node: ${SELECTED_NODE} (Group: ${SELECTED_GROUP})"
 
 # Test and verify outbound IP and Country
 OUTBOUND_INFO=$(curl -s -x "${PROXY_URL}" --max-time 15 "http://ip-api.com/line?fields=country,city,query,isp" 2>/dev/null || echo "unknown")

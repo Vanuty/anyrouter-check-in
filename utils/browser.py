@@ -357,22 +357,43 @@ async def navigate_login_page(
 
 	for attempt in range(3):
 		print(f'[INFO] Navigating login page (attempt {attempt + 1}/3): {login_url}')
-		await page.goto(login_url, wait_until='load', timeout=attempt_timeout)
-		await _settle_page(page, 5, 20_000)
+		nav_success = False
+		try:
+			await page.goto(login_url, wait_until='domcontentloaded', timeout=attempt_timeout)
+			curr_url = page.url.lower()
+			if curr_url.startswith('chrome-error://') or curr_url == 'about:blank':
+				raise RuntimeError(f'Landed on internal error page: {curr_url}')
+			await _settle_page(page, 5, 20_000)
+			nav_success = True
+		except Exception as nav_exc:
+			print(f'[WARN] Navigation attempt {attempt + 1}/3 failed: {nav_exc}')
+			try:
+				from utils.proxy import heal_proxy_connection
 
-		if await _wait_for_login_shell(page, attempt_timeout):
-			await wait_for_site_ready(page, timeout_ms)
-			if await page.evaluate(_LOGIN_SHELL_READY_JS):
-				return
+				heal_proxy_connection()
+			except Exception:  # nosec B110
+				pass
+
+		if nav_success:
+			if await _wait_for_login_shell(page, attempt_timeout):
+				await wait_for_site_ready(page, timeout_ms)
+				if await page.evaluate(_LOGIN_SHELL_READY_JS):
+					return
 
 		print(f'[WARN] Login page shell not ready on attempt {attempt + 1}')
-		await _log_login_page_state(page)
-		if provider and account_name:
-			await save_login_screenshot(page, provider, account_name, f'login-shell-attempt-{attempt + 1}')
+		try:
+			await _log_login_page_state(page)
+			if provider and account_name:
+				await save_login_screenshot(page, provider, account_name, f'login-shell-attempt-{attempt + 1}')
+		except Exception:  # nosec B110
+			pass
+
 		if attempt < 2:
-			await asyncio.sleep(5)
+			wait_secs = 5 + (attempt * 3)
+			print(f'[INFO] Waiting {wait_secs}s before retrying navigation...')
+			await asyncio.sleep(wait_secs)
 			try:
-				await page.reload(wait_until='load', timeout=attempt_timeout)
+				await page.reload(wait_until='domcontentloaded', timeout=attempt_timeout)
 			except Exception:  # nosec B110
 				pass
 

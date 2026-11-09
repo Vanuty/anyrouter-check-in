@@ -392,7 +392,26 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	auth_method = None
 	if account.provider == 'agentrouter' and (account.has_oauth_session() or account.cookies):
 		print(f'[INFO] {account_name}: Using in-page silent authentication for AgentRouter (Bypassing Baxia WAF)...')
-		return await run_agentrouter_browser_oauth_checkin(account, account_name, provider_config)
+		max_ar_attempts = 2
+		for ar_attempt in range(1, max_ar_attempts + 1):
+			if ar_attempt > 1:
+				print(
+					f'[RETRY] {account_name}: Retrying AgentRouter in-page silent authentication '
+					f'(attempt {ar_attempt}/{max_ar_attempts})...'
+				)
+				try:
+					from utils.proxy import heal_proxy_connection
+
+					heal_proxy_connection()
+				except Exception:
+					pass
+				await asyncio.sleep(8)
+			success, u_before, u_after = await run_agentrouter_browser_oauth_checkin(
+				account, account_name, provider_config
+			)
+			if success:
+				return success, u_before, u_after
+		return False, None, None
 	elif account.has_login_credentials():
 		login_id = account.username or account.email
 		print(f'[INFO] {account_name}: Attempting credential login ({login_id}) (priority)...')

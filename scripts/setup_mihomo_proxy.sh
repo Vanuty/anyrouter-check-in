@@ -213,8 +213,20 @@ echo "${OUTBOUND_INFO}"
 
 # Probe AgentRouter web page to verify anti-bot bypass
 echo "[INFO] Probing AgentRouter connectivity via proxy..."
-AR_TITLE=$(curl -s -L -x "${PROXY_URL}" --max-time 15 "https://agentrouter.org" 2>/dev/null | grep -o '<title>[^<]*</title>' || echo "none")
-echo "[INFO] AgentRouter Page Title: ${AR_TITLE}"
+AR_READY=false
+for ar_attempt in $(seq 1 3); do
+	AR_TITLE=$(curl -s -L -x "${PROXY_URL}" --max-time 15 "https://agentrouter.org" 2>/dev/null | grep -o '<title>[^<]*</title>' || echo "none")
+	if [[ "${AR_TITLE}" =~ "Agent Router" ]]; then
+		AR_READY=true
+		echo "[INFO] AgentRouter Page Title: ${AR_TITLE}"
+		break
+	fi
+	echo "[WARN] AgentRouter connectivity check (attempt ${ar_attempt}/3) returned: ${AR_TITLE}, triggering proxy re-benchmark..."
+	curl -s "http://127.0.0.1:9090/group/CHECKIN_SG/delay?url=${PROXY_TEST_URL}&timeout=4000" >/dev/null 2>&1 || true
+	curl -s "http://127.0.0.1:9090/group/CHECKIN_ALL/delay?url=${PROXY_TEST_URL}&timeout=4000" >/dev/null 2>&1 || true
+	curl -X DELETE "http://127.0.0.1:9090/connections" >/dev/null 2>&1 || true
+	sleep 3
+done
 
 echo "[INFO] Proxy is scoped to CHECKIN_PROXY_URL (browser/python only, not global HTTP_PROXY)"
 if [[ -n "${GITHUB_ENV:-}" ]]; then

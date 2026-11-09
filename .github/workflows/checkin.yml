@@ -138,7 +138,7 @@ jobs:
         xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run checkin.py
 
     - name: 上传调试截图
-      if: always() && env.DEBUG_MODE == 'true'
+      if: always() && (env.DEBUG_MODE == 'true' || job.status != 'success')
       env:
         HTTP_PROXY: ''
         HTTPS_PROXY: ''
